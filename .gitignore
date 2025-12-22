@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# Local usage counter
+.usage.json
+
+# Test / scratch files
+list_models.py
+test_gemini.py
+test_gemini_new.py
+
+# Documents / notes
+documents/
