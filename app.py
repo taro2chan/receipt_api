@@ -1,106 +1,165 @@
 # app.py
 from __future__ import annotations
 
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
-from typing import Any, Dict, List
-import os
 import json
 import re
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse, JSONResponse
+from pydantic import BaseModel
 
 from google import genai
-from google.genai import types
+
+
+# =========================================================
+# 設定（ここだけ触る）
+# =========================================================
+
+SAVE_OCR_TEXT = True      # ← デフォルトOFF（必要な期間だけ True にする）
+SAVE_MODE = "local"       # "local" or "icloud"
+
+LOCAL_SAVE_DIR = Path.cwd() / "ocr_texts"
+ICLOUD_SAVE_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/ReceiptsOCR"
+
+MODEL_NAME = "models/gemini-2.0-flash"
+
+# =========================================================
+
 
 app = FastAPI()
 
-# =========================
-# Config
-# =========================
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "models/gemini-2.0-flash")
 
 # =========================
 # Request body
 # =========================
-class ReceiptText(BaseModel):
+class ParseRequest(BaseModel):
     text: str
 
+
 # =========================
-# Helpers
+# OCR保存機能（ここに全て閉じ込める）
 # =========================
-def _require_env(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
+def _get_save_dir() -> Path:
+    base = ICLOUD_SAVE_DIR if SAVE_MODE == "icloud" else LOCAL_SAVE_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
-def _extract_json_from_text(text_out: str) -> Dict[str, Any]:
+
+def maybe_save_ocr_text(text: str) -> Optional[Path]:
     """
-    Geminiの出力からJSONだけを安全に取り出す
+    OCRテキスト保存はこの関数だけ。
+    この関数と呼び出し1行を消せば、機能は完全に外せる。
     """
-    t = text_out.strip()
+    if not SAVE_OCR_TEXT:
+        return None
 
-    # ```json ... ``` を剥がす
-    t = re.sub(r"^\s*```(?:json)?\s*", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s*```\s*$", "", t)
+    save_dir = _get_save_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = save_dir / f"ocr_{ts}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
 
-    # { ... } だけを抜く保険
-    if not (t.startswith("{") and t.endswith("}")):
-        m = re.search(r"\{[\s\S]*\}", t)
+
+# =========================
+# Utility
+# =========================
+def _extract_json_block(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    if not (s.startswith("{") and s.endswith("}")):
+        m = re.search(r"\{[\s\S]*\}", s)
         if m:
-            t = m.group(0)
+            s = m.group(0)
+    return s
 
-    return json.loads(t)
 
-def _s(v) -> str:
-    return "" if v is None else str(v)
+def _coerce_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(x)
+    if isinstance(x, str):
+        t = x.replace("¥", "").replace(",", "").replace("・", "").replace("·", "")
+        t = re.sub(r"[^\d\-]", "", t)
+        if t == "" or t == "-":
+            return None
+        try:
+            return int(t)
+        except ValueError:
+            return None
+    return None
 
-def to_tsv(parsed: dict) -> str:
-    """
-    TSV:
-    1行目: RECEIPT
-    2行目以降: ITEM（複数可）
-    """
-    lines: List[str] = []
 
-    receipt_cols = [
-        "RECEIPT",
-        _s(parsed.get("datetime")),
-        _s(parsed.get("store")),
-        _s(parsed.get("total_yen")),
-        _s(parsed.get("tax_yen")),
-        _s(parsed.get("payment")),
+def normalize_parsed(d: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "store": d.get("store"),
+        "datetime": d.get("datetime"),
+        "total_yen": _coerce_int(d.get("total_yen")),
+        "tax_yen": _coerce_int(d.get("tax_yen")),
+        "payment": d.get("payment"),
+        "items": [],
+    }
+
+    for it in d.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name")
+        if not name:
+            continue
+        out["items"].append({
+            "name": name,
+            "qty": _coerce_int(it.get("qty")),
+            "unit_yen": _coerce_int(it.get("unit_yen")),
+            "line_yen": _coerce_int(it.get("line_yen")),
+            "tax_rate": _coerce_int(it.get("tax_rate")),
+        })
+
+    return out
+
+
+def to_tsv_multiline(parsed: Dict[str, Any]) -> str:
+    lines = []
+    header = [
+        parsed.get("datetime") or "",
+        parsed.get("store") or "",
+        str(parsed.get("total_yen") or ""),
+        str(parsed.get("tax_yen") or ""),
+        parsed.get("payment") or "",
     ]
-    lines.append("\t".join(receipt_cols))
+    lines.append("\t".join(header))
 
     for it in parsed.get("items", []):
-        item_cols = [
-            "ITEM",
-            _s(it.get("name")),
-            _s(it.get("qty")),
-            _s(it.get("unit_yen")),
-            _s(it.get("line_yen")),
-            _s(it.get("tax_rate")),
-        ]
-        lines.append("\t".join(item_cols))
+        lines.append("\t".join([
+            it.get("name") or "",
+            "" if it.get("qty") is None else str(it.get("qty")),
+            "" if it.get("unit_yen") is None else str(it.get("unit_yen")),
+            "" if it.get("line_yen") is None else str(it.get("line_yen")),
+            "" if it.get("tax_rate") is None else str(it.get("tax_rate")),
+        ]))
 
     return "\n".join(lines) + "\n"
 
+
 # =========================
-# Gemini parse (1 call)
+# Gemini parse（1回呼び）
 # =========================
 def gemini_parse_receipt(text: str) -> Dict[str, Any]:
-    api_key = _require_env("GEMINI_API_KEY")
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=_require_gemini_key())
 
     prompt = f"""
-あなたは日本のレシートOCRテキストを家計簿入力用に構造化します。
-次の text から情報を抽出し、**JSONのみ**で返してください（説明文は禁止）。
+以下は日本のレシートOCRテキストです。
+内容を読み取り、JSONのみで返してください。
 
-出力JSONスキーマ（必須）:
+JSONスキーマ:
 {{
   "store": string|null,
-  "datetime": string|null,   // "2025-12-21 16:49"
+  "datetime": string|null,
   "total_yen": int|null,
   "tax_yen": int|null,
   "payment": string|null,
@@ -116,50 +175,54 @@ def gemini_parse_receipt(text: str) -> Dict[str, Any]:
 }}
 
 ルール:
-- items には商品だけ入れる（小計・合計・税などは除外）
-- 金額は必ず int（円）
-- (6個x@128) → qty=6, unit_yen=128, line_yen=768
-- 行がずれていても近接行を対応づけてよい
-- 推測しすぎない
-- JSON以外は絶対に出力しない
+- items には商品行のみ
+- 小計/合計/税/注意書きは items に入れない
+- 数値は円の整数
+- (6個x@128) は qty=6, unit_yen=128, line_yen=768
 
 text:
-\"\"\"{text}\"\"\"
+{text}
 """.strip()
-
-    config = types.GenerateContentConfig(
-        temperature=0.0,
-        response_mime_type="application/json",
-    )
 
     resp = client.models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
-        config=config,
+        config={"temperature": 0},
     )
 
-    text_out = getattr(resp, "text", None)
-    if not isinstance(text_out, str) or not text_out.strip():
-        text_out = str(resp)
+    raw = resp.text if isinstance(resp.text, str) else str(resp)
+    data = json.loads(_extract_json_block(raw))
+    return normalize_parsed(data)
 
-    return _extract_json_from_text(text_out)
+
+def _require_gemini_key() -> str:
+    import os
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    return key
+
 
 # =========================
 # Routes
 # =========================
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "server is running"}
+    return {"status": "ok"}
+
 
 @app.post("/parse")
-def parse_receipt(data: ReceiptText):
+def parse(req: ParseRequest):
     try:
-        parsed = gemini_parse_receipt(data.text)
-        tsv = to_tsv(parsed)
-        return PlainTextResponse(tsv, media_type="text/plain; charset=utf-8")
+        # OCRテキスト保存（ONのときだけ）
+        maybe_save_ocr_text(req.text)
+
+        parsed = gemini_parse_receipt(req.text)
+        tsv = to_tsv_multiline(parsed)
+        return PlainTextResponse(tsv)
+
     except Exception as e:
-        return {
-            "status": "ng",
-            "error": type(e).__name__,
-            "message": str(e),
-        }
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ng", "error": type(e).__name__, "message": str(e)},
+        )
