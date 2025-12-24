@@ -1,152 +1,200 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
 import os
 import json
 import re
+import sys
+import subprocess
 from datetime import datetime
+from typing import List, Optional
+
 import google.generativeai as genai
+import uvicorn
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
 
 # =========================
-# 設定スイッチ（ここだけ）
+# 設定・定数
 # =========================
-SAVE_OCR_TEXT = True   # True にすると OCR を保存
-SAVE_TSV = True        # True にすると TSV を保存
-SAVE_DIR = "saved_data" # 保存先ディレクトリ
-
+SAVE_OCR_TEXT = True
+SAVE_TSV = True
+SAVE_DIR = "saved_data"
 MODEL_NAME = "gemini-2.0-flash"
 
+# セキュリティトークン（環境変数推奨、デフォルト値は開発用）
+SECRET_TOKEN = os.environ.get("MY_APP_TOKEN", "my-secret-key-123")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Geminiの初期設定
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
 # =========================
+# データモデル定義
+# =========================
+class ReceiptItem(BaseModel):
+    name: str
+    qty: Optional[int] = None
+    unit_yen: Optional[int] = None
+    line_yen: Optional[int] = None
+    tax_rate: Optional[int] = None
 
-app = FastAPI()
+class ReceiptData(BaseModel):
+    store: Optional[str] = None
+    datetime: Optional[str] = None
+    total_yen: Optional[int] = None
+    tax_yen: Optional[int] = None
+    payment: Optional[str] = None
+    items: List[ReceiptItem] = []
 
-class ReceiptText(BaseModel):
+class ReceiptRequest(BaseModel):
     text: str
 
-
+# =========================
+# ユーティリティ関数
+# =========================
 def ensure_dir():
     if (SAVE_OCR_TEXT or SAVE_TSV) and not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR, exist_ok=True)
 
+def safe_filename(name: str) -> str:
+    """ファイル名に使えない文字をアンダースコアに置換"""
+    return re.sub(r"[^\w\-ぁ-んァ-ヶ一-龠]", "_", name)
 
-def extract_json_from_text(text: str) -> Dict[str, Any]:
-    text = re.sub(r"^```json", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        raise ValueError("JSON not found in LLM output")
-    return json.loads(m.group(0))
+def copy_to_clipboard(text: str):
+    """Macのpbcopyを使用してテキストをクリップボードにコピー"""
+    try:
+        process = subprocess.Popen('pbcopy', stdin=subprocess.PIPE)
+        process.communicate(text.encode('utf-8'))
+    except Exception as e:
+        print(f"Clipboard Error: {e}")
 
+def build_tsv(data: ReceiptData) -> str:
+    """ReceiptDataオブジェクトからTSV文字列を生成"""
+    lines = []
+    # ヘッダー（概要）
+    lines.append("\t".join([
+        data.datetime or "",
+        data.store or "",
+        str(data.total_yen or ""),
+        str(data.tax_yen or ""),
+        data.payment or ""
+    ]))
+    # 明細
+    for item in data.items:
+        lines.append("\t".join([
+            "", # 日付列を空けて明細であることを示す
+            item.name or "",
+            str(item.qty or ""),
+            str(item.unit_yen or ""),
+            str(item.line_yen or ""),
+            str(item.tax_rate or "")
+        ]))
+    return "\n".join(lines) + "\n"
 
-def call_llm(text: str) -> Dict[str, Any]:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-
-    genai.configure(api_key=api_key)
+# =========================
+# コアロジック
+# =========================
+def call_gemini(text: str) -> ReceiptData:
+    """AIを使用してOCRテキストを構造化データに変換"""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
 
     prompt = f"""
-次のOCRテキストを日本のレシートとして解析し、JSONのみで返してください。
+OCRテキストからレシート情報を抽出し、必ず以下のJSONスキーマに完全に一致する形で返してください。
+リスト([ ])で囲わず、単体オブジェクト({{ }})で出力してください。
 
 スキーマ:
 {{
-  "store": string|null,
-  "datetime": string|null,
-  "total_yen": int|null,
-  "tax_yen": int|null,
-  "payment": string|null,
+  "store": "店名(string)",
+  "datetime": "YYYY-MM-DD HH:MM(string)",
+  "total_yen": 合計金額(integer),
+  "tax_yen": 消費税額(integer),
+  "payment": "支払い方法(string)",
   "items": [
-    {{
-      "name": string,
-      "qty": int|null,
-      "unit_yen": int|null,
-      "line_yen": int|null,
-      "tax_rate": int|null
-    }}
+    {{ "name": "名", "qty": 数, "unit_yen": 単価, "line_yen": 小計, "tax_rate": 税率 }}
   ]
 }}
 
-ルール:
-- 分からない項目は null
-- 推測はしてよいが無理はしない
-- JSON以外は出力しない
-
-OCR:
+OCRテキスト:
 {text}
 """
-
     model = genai.GenerativeModel(MODEL_NAME)
-    resp = model.generate_content(prompt, generation_config={"temperature": 0})
+    config = {"temperature": 0, "response_mime_type": "application/json"}
+    
+    response = model.generate_content(prompt, generation_config=config)
+    
+    # デバッグ出力
+    print(f"--- Gemini Raw Response ---\n{response.text}\n---------------------------")
+    
+    data = json.loads(response.text)
+    # リストで返ってきた場合の救済
+    if isinstance(data, list) and data:
+        data = data[0]
+        
+    return ReceiptData.model_validate(data)
 
-    out = resp.text if hasattr(resp, "text") else str(resp)
-    return extract_json_from_text(out)
-
-
-def safe_filename(name: str) -> str:
-    return re.sub(r"[^\w\-ぁ-んァ-ヶ一-龠]", "_", name)
-
-
-def save_files(parsed: Dict[str, Any], ocr_text: str):
+def save_output(data: ReceiptData, raw_text: str):
+    """結果をファイルとして保存"""
     ensure_dir()
-
-    dt_raw = parsed.get("datetime")
-    try:
-        dt = datetime.strptime(dt_raw, "%Y-%m-%d %H:%M")
-    except Exception:
-        dt = datetime.now()
-
-    ts = dt.strftime("%Y%m%d_%H%M")
-    store = parsed.get("store") or "unknown"
-    store = safe_filename(store)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    store_name = safe_filename(data.store or "unknown")
+    base_path = os.path.join(SAVE_DIR, f"{store_name}_{ts}")
 
     if SAVE_OCR_TEXT:
-        with open(os.path.join(SAVE_DIR, f"{store}_{ts}_ocr.txt"), "w", encoding="utf-8") as f:
-            f.write(ocr_text)
+        with open(f"{base_path}_ocr.txt", "w", encoding="utf-8") as f:
+            f.write(raw_text)
 
     if SAVE_TSV:
-        tsv = build_tsv(parsed)
-        with open(os.path.join(SAVE_DIR, f"{store}_{ts}.tsv"), "w", encoding="utf-8") as f:
-            f.write(tsv)
+        with open(f"{base_path}.tsv", "w", encoding="utf-8") as f:
+            f.write(build_tsv(data))
 
-
-def build_tsv(parsed: Dict[str, Any]) -> str:
-    lines = []
-    lines.append("\t".join([
-        parsed.get("datetime") or "",
-        parsed.get("store") or "",
-        str(parsed.get("total_yen") or ""),
-        str(parsed.get("tax_yen") or ""),
-        parsed.get("payment") or ""
-    ]))
-
-    for item in parsed.get("items", []):
-        lines.append("\t".join([
-            "",
-            item.get("name") or "",
-            str(item.get("qty") or ""),
-            str(item.get("unit_yen") or ""),
-            str(item.get("line_yen") or ""),
-            str(item.get("tax_rate") or "")
-        ]))
-
-    return "\n".join(lines) + "\n"
-
+# =========================
+# FastAPI エンドポイント
+# =========================
+app = FastAPI()
 
 @app.post("/parse")
-def parse_receipt(data: ReceiptText):
-    parsed = {}
-    try:
-        parsed = call_llm(data.text)
-    except Exception:
-        parsed = {
-            "store": None,
-            "datetime": None,
-            "total_yen": None,
-            "tax_yen": None,
-            "payment": None,
-            "items": []
-        }
-    finally:
-        save_files(parsed, data.text)
+async def parse_receipt(request: ReceiptRequest, x_api_token: Optional[str] = Header(None)):
+    if x_api_token != SECRET_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid API Token")
 
-    return build_tsv(parsed)
+    try:
+        parsed_data = call_gemini(request.text)
+    except Exception as e:
+        print(f"AI Logic Error: {e}")
+        parsed_data = ReceiptData(items=[])
+
+    save_output(parsed_data, request.text)
+    return build_tsv(parsed_data)
+
+# =========================
+# メイン実行ブロック
+# =========================
+if __name__ == "__main__":
+    # 引数がある場合はコマンドラインモード（Terminalから実行）
+    if len(sys.argv) > 1:
+        target_file = sys.argv[1]
+        if not os.path.exists(target_file):
+            print(f"File not found: {target_file}")
+            sys.exit(1)
+
+        with open(target_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        print(f"🚀 Processing: {target_file}")
+        try:
+            result_data = call_gemini(content)
+            save_output(result_data, content)
+            tsv_text = build_tsv(result_data)
+            
+            # Mac用クリップボードコピー
+            copy_to_clipboard(tsv_text)
+            
+            print(f"\n--- Result ---\n{tsv_text}")
+            print("✅ クリップボードにコピーしました。Excelにペーストできます。")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            
+    # 引数がない場合はサーバーモード
+    else:
+        print(f"📡 Starting FastAPI Server on http://127.0.0.1:8000")
+        uvicorn.run(app, host="127.0.0.1", port=8000)
