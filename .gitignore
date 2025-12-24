@@ -9,11 +9,8 @@ list_models.py
 test_gemini.py
 test_gemini_new.py
 
-# Documents / notes
-documents/
-
 # tools
 tools/
 
-# ocr_texts
-ocr_texts/
+# saved_data
+saved_data/
