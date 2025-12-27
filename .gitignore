@@ -4,6 +4,9 @@ __pycache__/
 # Local usage counter
 .usage.json
 
+# macOS
+.DS_Store
+
 # Test / scratch files
 list_models.py
 test_gemini.py
