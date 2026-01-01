@@ -1,0 +1,7 @@
+fastapi==0.127.1
+google-genai==1.56.0
+pydantic==2.12.5
+pydantic_core==2.41.5
+python-multipart==0.0.21
+PyYAML==6.0.3
+uvicorn==0.40.0
